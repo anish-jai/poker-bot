@@ -184,6 +184,7 @@ class PokerMatch:
         self.api_client = AgentAPIClient(logger, self.failure_tracker)
     
     def _play_hand(self, hand_number: int):
+        """Play a single hand of poker"""
         
         small_blind_player = hand_number % self.num_players
 
@@ -193,8 +194,90 @@ class PokerMatch:
         rewards = [0.0] * self.num_players
         terminated = truncated = False
         
+        # Add time info to observations
+        self._update_time_info(observations)
+        
+        # Main game loop
+        while not terminated:
+            action = self._get_action_from_active_player(observations, rewards, terminated, truncated, info)
+            self._broadcast_to_inactive_players(observations, rewards, terminated, truncated, info)
+            
+            # Step environment
+            observations, rewards, terminated, truncated, info = self.env.step(action=action["action"])
+            info["hand_number"] = hand_number
+            self._update_time_info(observations)
+        
+        # Send final observations
+        self._send_final_observations(observations, rewards, terminated, truncated, info)
+
+        # Update bankrolls
+        for i, reward in enumerate(rewards):
+            self.bankrolls[i] += reward
+            
+    def _get_action_from_active_player(
+        self,
+        observations: List[Dict[str, Any]],
+        rewards: List[float],
+        terminated: bool,
+        truncated: bool,
+        info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Get action from the currently active player"""
+        acting_player = observations[0]["acting_agent"]
+        obs = observations[acting_player]
+        url = self.base_urls[acting_player]
+        
+        payload = self.payload_preparer.prepare(obs, rewards[acting_player], terminated, truncated, info)
+        
+        start_time = time.time()
+        action = self.api_client.call("GET", url, GET_ACTION_ENDPOINT, payload, acting_player)
+        elapsed = time.time() - start_time
+        
+        self.time_used[acting_player] += elapsed
+        
+        if self.time_used[acting_player] > TIME_LIMIT_SECONDS:
+            raise TimeoutError(f"Player {acting_player} exceeded time limit")
+        
+        return action
+        
+    def _broadcast_to_inactive_players(
+        self,
+        observations: List[Dict[str, Any]],
+        rewards: List[float],
+        terminated: bool,
+        truncated: bool,
+        info: Dict[str, Any]
+    ) -> None:
+        """Send observations to all inactive players"""
+        acting_player = observations[0]["acting_agent"]
+        
+        for player_id in range(self.num_players):
+            if player_id != acting_player:
+                obs = observations[player_id]
+                url = self.base_urls[player_id]
+                payload = self.payload_preparer.prepare(obs, rewards[player_id], terminated, truncated, info)
+                self.api_client.call("POST", url, SEND_OBS_ENDPOINT, payload, player_id)
+
+    def _send_final_observations(
+        self,
+        observations: List[Dict[str, Any]],
+        rewards: List[float],
+        terminated: bool,
+        truncated: bool,
+        info: Dict[str, Any]
+    ) -> None:
+        """Send final observations to all players after hand completes"""
+        for player_id in range(self.num_players):
+            obs = observations[player_id]
+            url = self.base_urls[player_id]
+            payload = self.payload_preparer.prepare(obs, rewards[player_id], terminated, truncated, info)
+            self.api_client.call("POST", url, SEND_OBS_ENDPOINT, payload, player_id)
     
-    
+    def _update_time_info(self, observations: List[Dict[str, Any]]) -> None:
+        """Add time usage information to observations"""
+        for i, obs in enumerate(observations):
+            obs["time_used"] = self.time_used[i]
+            obs["time_left"] = TIME_LIMIT_SECONDS - self.time_used[i]
 
 
 
