@@ -7,7 +7,7 @@ import json
 import logging
 import time
 import traceback
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, TypedDict
 
 import numpy as np
 import requests
@@ -26,6 +26,48 @@ class AgentFailure(Exception):
 
     pass
 
+
+class MatchResult(TypedDict):
+    """Standardized match result structure"""
+    status: str  # 'completed', 'timeout', or 'error'
+    result: str  # 'win', 'loss', 'tie', or 'invalid'
+    rewards: List[float]
+    time_used: List[float]
+    error: Optional[str] = None
+
+class AgentAPIClient:
+    """Handles API communication with agents"""
+    
+    
+    
+class PokerMatch:
+    """Manages a complete poker match between multiple agents"""
+    def __init__(
+        self,
+        base_urls: List[str],
+        logger: logging.Logger,
+        team_names: Optional[List[str]] = None,
+        num_hands: int = 1000,
+        csv_path: str = "./match.csv"
+    ):
+        ...
+        self.base_urls = base_urls
+        self.num_players = NUM_PLAYERS # NOTE might change later
+        self.logger = logger
+        self.team_names = team_names or [f"Player {i}" for i in range(self.num_players)]
+        self.num_hands = num_hands
+        self.csv_path = csv_path
+        
+        # Initialize trackers
+        self.bankrolls = [0.0] * self.num_players
+        self.time_used = [0.0] * self.num_players
+        self.failure_tracker = AgentFailureTracker(self.num_players)
+        
+        # Initialize helpers
+        self.api_client = AgentAPIClient(logger, self.failure_tracker)
+        
+    
+    
 
 class AgentFailureTracker:
     def __init__(self):
@@ -204,7 +246,6 @@ def run_api_match(
 
         for hand_number in range(num_hands):
             env = PokerEnv(logger=logger)  # env for a single hand
-            (obs0, obs1), info = env.reset()
             try:
                 res = play_hand(env, base_url_0, base_url_1, logger, writer, hand_number)
                 bankrolls[0] += res["bot0_reward"]
@@ -321,7 +362,7 @@ def play_hand(
         bot_payload = prepare_payload(obs, reward, terminated, truncated, info)
         call_agent_api("POST", url, SEND_OBS_ENDPOINT, bot_payload, logger, player)
 
-    return {f"bot{player}_reward": rewards[player] for player in range(NUM_PLAYERS)}
+    return rewards
 
     
     
