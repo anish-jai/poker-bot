@@ -8,6 +8,7 @@ import logging
 import time
 import traceback
 from typing import Any, Dict, Optional, Tuple, List, TypedDict
+from collections import defaultdict
 
 import numpy as np
 import requests
@@ -19,13 +20,7 @@ NUM_PLAYERS = 6
 TIME_LIMIT_SECONDS = 1500
 GET_ACTION_ENDPOINT = "/get_action"
 SEND_OBS_ENDPOINT = "/post_observation"
-
-
-class AgentFailure(Exception):
-    """Custom exception for tracking agent failures"""
-
-    pass
-
+MAX_AGENT_FAILURES = 3
 
 class MatchResult(TypedDict):
     """Standardized match result structure"""
@@ -35,9 +30,83 @@ class MatchResult(TypedDict):
     time_used: List[float]
     error: Optional[str] = None
 
+class AgentFailure(Exception):
+    """Custom exception for tracking agent failures"""
+
+    pass
+
+class AgentFailureTracker:
+    def __init__(self):
+        self.failed_attempts = {i: 0 for i in range(NUM_PLAYERS)}
+
+    def record_failure(self, player_id: int):
+        self.failed_attempts[player_id] += 1
+
+        # Check for all players failing
+        all_failed = all(attempts > MAX_AGENT_FAILURES for attempts in self.failed_attempts.values())
+        if all_failed:
+            raise AgentFailure("Both players have failed multiple times")
+
+        # Check for single player persistent failure
+        if self.failed_attempts[player_id] >= MAX_AGENT_FAILURES:
+            raise AgentFailure(f"Player {player_id} has failed {self.MAX_FAILURES} times")
+
+    def record_success(self, player_id: int):
+        self.failed_attempts[player_id] = 0
+
+
+
 class AgentAPIClient:
     """Handles API communication with agents"""
-    
+    def __init__(
+        self,
+        logger: logging.Logger,
+        failure_tracker: AgentFailureTracker,
+        max_retries: int = 5,
+        base_delay: float = 1.0,
+        timeout: float = 5.0
+    ):
+        self.logger = logger
+        self.failure_tracker = failure_tracker
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.timeout = timeout
+
+    def call(
+        self,
+        method: str,
+        base_url: str,
+        endpoint: str,
+        payload: Dict[str, Any],
+        player_id: int,
+    ) -> Dict[str, Any]:
+        """Make an API call with retry logic and failure tracking"""
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.request(
+                    method,
+                    base_url + endpoint,
+                    json=payload,
+                    timeout=self.timeout
+                )
+                response.raise_for_status()
+                self.failure_tracker.record_success(player_id)
+                return response.json()
+                
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.HTTPError,
+            ) as e:
+                if attempt == self.max_retries - 1:
+                    self.failure_tracker.record_failure(player_id)
+                    self.logger.error(f"Player {player_id} failed API call after {self.max_retries} attempts: {str(e)}")
+                    raise
+
+                delay = self.base_delay * (2 ** attempt)
+                self.logger.debug(f"Player {player_id} API call failed, retrying in {delay}s (attempt {attempt + 1}/{self.max_retries})")
+                time.sleep(delay)
+
     
     
 class PokerMatch:
@@ -50,7 +119,7 @@ class PokerMatch:
         num_hands: int = 1000,
         csv_path: str = "./match.csv"
     ):
-        ...
+        
         self.base_urls = base_urls
         self.num_players = NUM_PLAYERS # NOTE might change later
         self.logger = logger
@@ -69,24 +138,6 @@ class PokerMatch:
     
     
 
-class AgentFailureTracker:
-    def __init__(self):
-        self.failed_attempts = {0: 0, 1: 0}
-        self.MAX_FAILURES = 3
-
-    def record_failure(self, player_id: int):
-        self.failed_attempts[player_id] += 1
-
-        # Check for both players failing
-        if self.failed_attempts[0] >= self.MAX_FAILURES and self.failed_attempts[1] >= self.MAX_FAILURES:
-            raise AgentFailure("Both players have failed multiple times")
-
-        # Check for single player persistent failure
-        if self.failed_attempts[player_id] >= self.MAX_FAILURES:
-            raise AgentFailure(f"Player {player_id} has failed {self.MAX_FAILURES} times")
-
-    def record_success(self, player_id: int):
-        self.failed_attempts[player_id] = 0
 
 
 # Create a global instance
