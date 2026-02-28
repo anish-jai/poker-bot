@@ -27,6 +27,7 @@ def main():
     bot1_class = load_agent_class(config['bot1']['file_path'])
 
     # Create processes using the configuration (stream=True so agent logs appear in console)
+    # To disable agent logs, set stream=False
     process0 = multiprocessing.Process(
         target=bot0_class.run,
         args=(True, config['bot0']['port']),
