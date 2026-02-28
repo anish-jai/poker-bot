@@ -4,14 +4,14 @@
 
 Your submission must meet these requirements:
 
-1. Keep everything you need to run your bot inside the `starter` folder
+1. Keep everything you need to run your bot inside a folder named `submission`
 2. Your main bot file must remain named `player.py`
 3. Your bot class must be named `PlayerAgent`
 
 ## Correct Structure (Example)
 
 ```
-starter/                # This is what you'll upload
+submission/             # Folder name must be exactly "submission"
 ├── player.py           # Main bot file (required)
 ├── my_utils.py         # Optional additional files
 ├── strategies/         # Optional subdirectories
@@ -23,7 +23,7 @@ starter/                # This is what you'll upload
 
 ## How to Submit
 
-1. Ensure all your code is inside the `starter` folder
+1. Ensure all your code is inside the `submission` folder
 2. Navigate to the [bots upload page](/bots/upload)
 3. Drag and drop your `starter` folder onto the upload area
 
@@ -35,6 +35,6 @@ starter/                # This is what you'll upload
 
 ## Common Submission Errors
 
-- Uploading individual files instead of the `starter` folder
+- Uploading individual files instead of the `submission` folder
 - Wrong class name (must be `PlayerAgent`)
 - Missing required methods
