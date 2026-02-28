@@ -86,7 +86,7 @@ class PokerEnv(gym.Env):
         DISCARD = 4
         INVALID = 5
 
-    def __init__(self, logger=None, small_blind_amount=10, num_hands=1):
+    def __init__(self, logger=None, small_blind_amount=1, num_hands=1):
         """
         Represents a single hand of poker.
         """
