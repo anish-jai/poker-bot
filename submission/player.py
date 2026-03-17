@@ -25,6 +25,10 @@ class PlayerAgent(Agent):
         self._prev_my_bet = 0
         self._prev_street = -1
 
+        self._bankroll = 0
+        self._fold_lockdown = False
+        self._total_hands = 1000
+
     def __name__(self):
         return "PlayerAgent"
 
@@ -76,6 +80,16 @@ class PlayerAgent(Agent):
         # Track opponent action that happened before our turn
         self._track_opp_action(observation)
 
+        # --- Fold lockdown: we're ahead enough to coast ---
+        if self._fold_lockdown:
+            if valid[DISCARD]:
+                return (DISCARD, 0, 0, 1)
+            if valid[CHECK]:
+                return (CHECK, 0, 0, 0)
+            if valid[FOLD]:
+                return (FOLD, 0, 0, 0)
+            return (CALL, 0, 0, 0)
+
         # --- Pre-flop (street 0): O(1) lookup ---
         if street == 0 and not valid[DISCARD]:
             strength = get_preflop_strength(tuple(my_cards))
@@ -119,6 +133,20 @@ class PlayerAgent(Agent):
             self.opp_profile.record_discard(tuple(opp_disc))
 
         if terminated:
+            self._bankroll += reward
+
+            # Check fold lockdown: can we win by folding every remaining hand?
+            # Exact cost: SB costs 1, BB costs 2, positions alternate.
+            hands_left = self._total_hands - (self.hand_number + 1)
+            if hands_left > 0 and self._bankroll > 0:
+                # Current hand's blind_position: 0=SB, 1=BB.
+                # Next hand we swap, so next_is_sb = (current is BB).
+                cur_blind = observation.get("blind_position", 0)
+                next_is_sb = (cur_blind == 1)
+                max_fold_cost = self._exact_fold_cost(hands_left, next_is_sb)
+                if self._bankroll > max_fold_cost:
+                    self._fold_lockdown = True
+
             # Record showdown info if available
             if "player_0_cards" in info:
                 blind_pos = observation.get("blind_position", 0)
@@ -150,6 +178,18 @@ class PlayerAgent(Agent):
     # Internal opponent action tracking
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _exact_fold_cost(hands_left: int, next_is_sb: bool) -> int:
+        """Exact chip cost of folding every remaining hand.
+        SB loses 1, BB loses 2, positions alternate each hand."""
+        if next_is_sb:
+            sb_hands = (hands_left + 1) // 2
+            bb_hands = hands_left // 2
+        else:
+            bb_hands = (hands_left + 1) // 2
+            sb_hands = hands_left // 2
+        return sb_hands * 1 + bb_hands * 2
+
     _ACTION_MAP = {
         "FOLD": FOLD, "RAISE": RAISE, "CHECK": CHECK,
         "CALL": CALL, "DISCARD": DISCARD,
@@ -172,6 +212,9 @@ class PlayerAgent(Agent):
             return
 
         street = observation["street"]
+        if street > 3:
+            return
+
         opp_bet = observation["opp_bet"]
         my_bet = observation["my_bet"]
         pot = observation.get("pot_size", my_bet + opp_bet)
