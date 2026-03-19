@@ -1,3 +1,5 @@
+from collections import deque
+
 from agents.agent import Agent
 from gym_env import PokerEnv
 
@@ -11,6 +13,8 @@ from submission import strategy
 
 
 class PlayerAgent(Agent):
+    MAX_RAISES_PER_STREET = 3
+
     def __init__(self, stream: bool = True):
         super().__init__(stream)
         self.action_types = PokerEnv.ActionType
@@ -28,6 +32,14 @@ class PlayerAgent(Agent):
         self._bankroll = 0
         self._fold_lockdown = False
         self._total_hands = 1000
+
+        # Raise cap per street (prevents timeout from raise wars)
+        self._my_raises_this_street = 0
+        self._current_street = -1
+
+        # Opponent lockdown detection: rolling window of recent hand outcomes
+        self._opp_recent_folds: deque[bool] = deque(maxlen=30)
+        self._opp_in_lockdown = False
 
     def __name__(self):
         return "PlayerAgent"
@@ -67,6 +79,18 @@ class PlayerAgent(Agent):
             return None
         return narrow_range_from_discards(opp_disc, remaining)
 
+    def _enforce_raise_cap(self, action: tuple, valid) -> tuple:
+        """Hard-cap raises per street to prevent timeout from raise wars."""
+        if action[0] == RAISE:
+            if self._my_raises_this_street >= self.MAX_RAISES_PER_STREET:
+                if valid[CALL]:
+                    return (CALL, 0, 0, 0)
+                if valid[CHECK]:
+                    return (CHECK, 0, 0, 0)
+                return (FOLD, 0, 0, 0)
+            self._my_raises_this_street += 1
+        return action
+
     # ------------------------------------------------------------------
     # act()  –  main decision pipeline
     # ------------------------------------------------------------------
@@ -80,7 +104,15 @@ class PlayerAgent(Agent):
         # Track opponent action that happened before our turn
         self._track_opp_action(observation)
 
-        # --- Fold lockdown: we're ahead enough to coast ---
+        # Reset raise counter when street advances
+        if street != self._current_street:
+            self._my_raises_this_street = 0
+            self._current_street = street
+
+        # --- Fold lockdown: re-check every action in case observe() missed it ---
+        if not self._fold_lockdown:
+            self._check_fold_lockdown(observation)
+
         if self._fold_lockdown:
             if valid[DISCARD]:
                 return (DISCARD, 0, 0, 1)
@@ -94,29 +126,45 @@ class PlayerAgent(Agent):
         if street == 0 and not valid[DISCARD]:
             strength = get_preflop_strength(tuple(my_cards))
             detail = get_preflop_detail(tuple(my_cards))
-            return strategy.preflop_action(
+            action = strategy.preflop_action(
                 observation, strength, detail,
                 self.opp_categorizer, self.opp_profile,
+                opp_in_lockdown=self._opp_in_lockdown,
             )
+            return self._enforce_raise_cap(action, valid)
 
         # --- Discard phase (street 1, mandatory) ---
         if valid[DISCARD]:
+            # If opponent is in lockdown, skip expensive equity computation
+            if self._opp_in_lockdown:
+                return (DISCARD, 0, 0, 1)
             dead = self._dead_cards(observation)
             rw = self._range_weights(observation)
             i, j, eq = find_best_keep(my_cards, community, dead, rw)
-            # Remember what we discarded for later dead-card tracking
             self._my_discards = [my_cards[k] for k in range(len(my_cards))
                                  if k != i and k != j]
             return (DISCARD, 0, i, j)
 
         # --- Post-discard betting (streets 1-3): exact equity ---
+        # If opponent is in lockdown, just min-raise to pressure them
+        if self._opp_in_lockdown:
+            if valid[RAISE]:
+                action = (RAISE, observation["min_raise"], 0, 0)
+                return self._enforce_raise_cap(action, valid)
+            if valid[CHECK]:
+                return (CHECK, 0, 0, 0)
+            if valid[CALL]:
+                return (CALL, 0, 0, 0)
+            return (FOLD, 0, 0, 0)
+
         dead = self._dead_cards(observation)
         rw = self._range_weights(observation)
         eq = compute_exact_equity(my_cards, community, dead, rw)
-        return strategy.choose_action(
+        action = strategy.choose_action(
             observation, eq,
             self.opp_categorizer, self.opp_profile,
         )
+        return self._enforce_raise_cap(action, valid)
 
     # ------------------------------------------------------------------
     # observe()  –  learning pipeline
@@ -135,17 +183,21 @@ class PlayerAgent(Agent):
         if terminated:
             self._bankroll += reward
 
+            # Track whether opponent folded pre-flop this hand
+            opp_last = observation.get("opp_last_action")
+            opp_folded = (opp_last == "FOLD") or (reward > 0 and reward <= 2)
+            self._opp_recent_folds.append(opp_folded)
+
+            # Detect opponent lockdown: >90% fold rate over last 30 hands
+            if len(self._opp_recent_folds) >= 20:
+                fold_rate = sum(self._opp_recent_folds) / len(self._opp_recent_folds)
+                self._opp_in_lockdown = fold_rate > 0.85
+            else:
+                self._opp_in_lockdown = False
+
             # Check fold lockdown: can we win by folding every remaining hand?
-            # Exact cost: SB costs 1, BB costs 2, positions alternate.
-            hands_left = self._total_hands - (self.hand_number + 1)
-            if hands_left > 0 and self._bankroll > 0:
-                # Current hand's blind_position: 0=SB, 1=BB.
-                # Next hand we swap, so next_is_sb = (current is BB).
-                cur_blind = observation.get("blind_position", 0)
-                next_is_sb = (cur_blind == 1)
-                max_fold_cost = self._exact_fold_cost(hands_left, next_is_sb)
-                if self._bankroll > max_fold_cost:
-                    self._fold_lockdown = True
+            if not self._fold_lockdown:
+                self._check_fold_lockdown(observation)
 
             # Record showdown info if available
             if "player_0_cards" in info:
@@ -173,22 +225,37 @@ class PlayerAgent(Agent):
             self._prev_opp_bet = 0
             self._prev_my_bet = 0
             self._prev_street = -1
+            self._my_raises_this_street = 0
+            self._current_street = -1
 
     # ------------------------------------------------------------------
-    # Internal opponent action tracking
+    # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _exact_fold_cost(hands_left: int, next_is_sb: bool) -> int:
-        """Exact chip cost of folding every remaining hand.
-        SB loses 1, BB loses 2, positions alternate each hand."""
-        if next_is_sb:
-            sb_hands = (hands_left + 1) // 2
-            bb_hands = hands_left // 2
-        else:
-            bb_hands = (hands_left + 1) // 2
-            sb_hands = hands_left // 2
-        return sb_hands * 1 + bb_hands * 2
+    def _check_fold_lockdown(self, observation):
+        """Check if we can win the match by folding every hand from now on.
+
+        Blinds alternate: SB costs 1, BB costs 2.  We compute the EXACT
+        total cost of folding every remaining hand and lock down the
+        instant our bankroll exceeds that cost by at least 1 chip.
+        """
+        hands_left = self._total_hands - (self.hand_number + 1)
+        if hands_left <= 0 or self._bankroll <= 0:
+            return
+
+        # Determine what blind we'll be NEXT hand.
+        # blind_position: 0 = we are SB this hand, 1 = we are BB this hand.
+        # Positions swap every hand, so next hand is the opposite.
+        cur_blind = observation.get("blind_position", 0)
+        next_is_sb = (cur_blind == 1)
+
+        # Walk through every remaining hand and sum the blind cost.
+        cost = int(1.5 * hands_left) + 1
+
+        # Lock down if we'd still be ahead by at least 1 chip after paying
+        # all remaining blinds.  bankroll - cost >= 1  ⟺  bankroll > cost
+        if self._bankroll > cost:
+            self._fold_lockdown = True
 
     _ACTION_MAP = {
         "FOLD": FOLD, "RAISE": RAISE, "CHECK": CHECK,
