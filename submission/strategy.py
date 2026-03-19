@@ -58,6 +58,14 @@ def preflop_action(observation: dict, strength: float, detail: dict,
             call_thresh = 0.42
             fold_thresh = 0.40
 
+        # [Fix 5] Tighten pre-flop against aggressive opponents.
+        # Play fewer hands but commit to the ones we play.
+        opp_pfr = profile.pfr()
+        if opp_pfr > 0.60:
+            fold_thresh = max(fold_thresh, 0.60)
+        elif opp_pfr > 0.40:
+            fold_thresh = max(fold_thresh, 0.55)
+
     # Steal detection: if opponent folds > 70% to raises, raise wide
     if hands >= 30:
         opp_fold_rate = profile.fold_to_raise_rate()
@@ -101,7 +109,9 @@ def preflop_action(observation: dict, strength: float, detail: dict,
 # ---------------------------------------------------------------------------
 
 def choose_action(observation: dict, equity: float,
-                  categorizer, profile) -> tuple:
+                  categorizer, profile,
+                  opp_mechanical: bool = False,
+                  opp_raises_this_hand: int = 0) -> tuple:
     valid = observation["valid_actions"]
     street = observation["street"]
     my_bet = observation["my_bet"]
@@ -122,7 +132,16 @@ def choose_action(observation: dict, equity: float,
         amt = max(int(pot * base_frac), min_raise)
         return max(min(amt, max_raise), min_raise)
 
-    committed_frac = my_bet / 100.0
+    # --- [Fix 3] Re-raise equity discount ---
+    # Opponent raising multiple times this hand signals real strength;
+    # discount our equity to avoid value-betting second-best hands.
+    effective_equity = equity
+    if opp_raises_this_hand >= 2 and not opp_mechanical:
+        effective_equity = equity * 0.75
+    elif opp_raises_this_hand >= 1 and not opp_mechanical:
+        we_raised = _did_we_raise_this_street(observation)
+        if we_raised:
+            effective_equity = equity * 0.85
 
     # --- Raise threshold: varies by opponent type ---
     raise_thresh = 0.78
@@ -134,9 +153,6 @@ def choose_action(observation: dict, equity: float,
         elif dom == "maniac":
             raise_thresh = 0.72
 
-    # --- Medium-strong value bet threshold ---
-    # Against tight opponents, only bet with strong equity (they fold
-    # weak and call strong, so thin value bets lose money)
     value_bet_thresh = 0.78 if is_tight else 0.70
 
     # --- Bet sizing ---
@@ -147,11 +163,36 @@ def choose_action(observation: dict, equity: float,
     else:
         raise_frac = 0.75
 
+    # --- [Fix 1] Mechanical aggressor call-down mode ---
+    # Against bots that raise every street regardless of hand strength,
+    # call down with decent equity instead of folding. We win showdowns.
+    if opp_mechanical and facing_raise:
+        if equity >= 0.40:
+            if equity > 0.80 and valid[RAISE]:
+                return (RAISE, _raise_size(raise_frac), 0, 0)
+            if valid[CALL]:
+                return (CALL, 0, 0, 0)
+        mech_call_thresh = max(pot_odds + 0.03, 0.30)
+        if equity >= mech_call_thresh and valid[CALL]:
+            return (CALL, 0, 0, 0)
+        if valid[CHECK]:
+            return (CHECK, 0, 0, 0)
+        return (FOLD, 0, 0, 0)
+
+    # --- [Fix 2] Investment protection guard ---
+    # If we've already committed significant chips, don't fold with decent equity.
+    # Prevents the call-call-fold bleed pattern.
+    if facing_raise and equity >= 0.40 and my_bet >= 25:
+        if valid[CALL]:
+            return (CALL, 0, 0, 0)
+    if facing_raise and equity >= 0.35 and my_bet >= 50:
+        if valid[CALL]:
+            return (CALL, 0, 0, 0)
+
     # --------------- POT COMMITMENT GUARD ---------------
-    # Don't commit heavy chips without strong equity
-    if my_bet > 50 and equity < 0.70:
+    if my_bet > 50 and effective_equity < 0.70:
         if facing_raise:
-            if valid[FOLD]:
+            if effective_equity < 0.25 and valid[FOLD]:
                 return (FOLD, 0, 0, 0)
         if valid[CHECK]:
             return (CHECK, 0, 0, 0)
@@ -160,35 +201,28 @@ def choose_action(observation: dict, equity: float,
     if facing_raise:
         bet_to_pot = continue_cost / max(pot, 1)
 
-        # Risk premium: raised from 0.04/0.06 to 0.08/0.10
         risk_premium = 0.08 + 0.10 * min(bet_to_pot, 2.0)
         call_threshold = pot_odds + risk_premium
 
-        # Against big bets (>60% of remaining stack), tighten further
         if continue_cost > 60 - my_bet:
             call_threshold = max(call_threshold, 0.65)
 
-        # Pot commitment: approaching all-in, need very strong hand
         if my_bet + continue_cost >= 90:
             call_threshold = max(call_threshold, 0.80)
 
-        # If we already raised this street and they re-raised,
-        # we need a very strong hand to continue
         we_raised_this_street = _did_we_raise_this_street(observation)
         if we_raised_this_street:
             call_threshold = max(call_threshold, 0.65)
-            if equity > 0.85 and valid[RAISE]:
+            if effective_equity > 0.85 and valid[RAISE]:
                 return (RAISE, _raise_size(0.75), 0, 0)
-            if equity >= call_threshold and valid[CALL]:
+            if effective_equity >= call_threshold and valid[CALL]:
                 return (CALL, 0, 0, 0)
             return (FOLD, 0, 0, 0)
 
-        # Strong hand facing a raise: re-raise
-        if equity > 0.85 and valid[RAISE]:
+        if effective_equity > 0.85 and valid[RAISE]:
             return (RAISE, _raise_size(raise_frac), 0, 0)
 
-        # Call if equity justifies it
-        if equity >= call_threshold and valid[CALL]:
+        if effective_equity >= call_threshold and valid[CALL]:
             return (CALL, 0, 0, 0)
 
         if valid[CHECK]:
@@ -197,12 +231,10 @@ def choose_action(observation: dict, equity: float,
 
     # --------------- NOT FACING A RAISE ---------------
 
-    # Strong hand: raise big for value
-    if equity > raise_thresh and valid[RAISE]:
+    if effective_equity > raise_thresh and valid[RAISE]:
         return (RAISE, _raise_size(raise_frac), 0, 0)
 
-    # Medium-strong: value bet only if threshold met
-    if equity > value_bet_thresh and valid[RAISE]:
+    if effective_equity > value_bet_thresh and valid[RAISE]:
         return (RAISE, _raise_size(0.60), 0, 0)
 
     if valid[CHECK]:

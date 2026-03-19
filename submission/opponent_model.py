@@ -204,6 +204,17 @@ class OpponentCategorizer:
     def update_beliefs(self, profile: OpponentProfile):
         if profile.hands_played < 5:
             return
+
+        # Hard override: unmistakable maniac detected by raw stats
+        if profile.hands_played >= 20:
+            pfr = profile.pfr()
+            agg = profile.aggression_factor()
+            if pfr > 0.50 and agg > 3.0:
+                for cat in CATEGORIES:
+                    self.beliefs[cat] = 0.02
+                self.beliefs["maniac"] = 0.88
+                return
+
         observed = {
             "vpip": profile.vpip(),
             "pfr": profile.pfr(),
@@ -225,10 +236,10 @@ class OpponentCategorizer:
             log_posteriors[cat] = math.exp(log_posteriors[cat])
             total += log_posteriors[cat]
 
-        # Laplace smoothing: blend 95% posterior, 5% uniform
+        # Laplace smoothing: blend 98% posterior, 2% uniform
         for cat in CATEGORIES:
-            self.beliefs[cat] = 0.95 * (log_posteriors[cat] / total) + \
-                                0.05 * (1.0 / len(CATEGORIES))
+            self.beliefs[cat] = 0.98 * (log_posteriors[cat] / total) + \
+                                0.02 * (1.0 / len(CATEGORIES))
 
     def dominant_category(self) -> str:
         return max(self.beliefs, key=self.beliefs.get)

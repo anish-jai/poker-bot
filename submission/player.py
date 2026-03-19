@@ -41,6 +41,14 @@ class PlayerAgent(Agent):
         self._opp_recent_folds: deque[bool] = deque(maxlen=30)
         self._opp_in_lockdown = False
 
+        # Mechanical aggressor detection: rolling post-flop raise frequency
+        self._opp_postflop_raises = 0
+        self._opp_postflop_actions = 0
+        self._opp_mechanical = False
+
+        # Per-hand opponent aggression tracking (for re-raise equity discount)
+        self._opp_raises_this_hand = 0
+
     def __name__(self):
         return "PlayerAgent"
 
@@ -163,6 +171,8 @@ class PlayerAgent(Agent):
         action = strategy.choose_action(
             observation, eq,
             self.opp_categorizer, self.opp_profile,
+            opp_mechanical=self._opp_mechanical,
+            opp_raises_this_hand=self._opp_raises_this_hand,
         )
         return self._enforce_raise_cap(action, valid)
 
@@ -188,12 +198,19 @@ class PlayerAgent(Agent):
             opp_folded = (opp_last == "FOLD") or (reward > 0 and reward <= 2)
             self._opp_recent_folds.append(opp_folded)
 
-            # Detect opponent lockdown: >90% fold rate over last 30 hands
+            # Detect opponent lockdown: >85% fold rate over last 20+ hands
             if len(self._opp_recent_folds) >= 20:
                 fold_rate = sum(self._opp_recent_folds) / len(self._opp_recent_folds)
                 self._opp_in_lockdown = fold_rate > 0.85
             else:
                 self._opp_in_lockdown = False
+
+            # Detect mechanical aggressor: >55% post-flop raise rate over 30+ hands
+            if self._opp_postflop_actions >= 40:
+                pf_raise_rate = self._opp_postflop_raises / self._opp_postflop_actions
+                self._opp_mechanical = pf_raise_rate > 0.55
+            else:
+                self._opp_mechanical = False
 
             # Check fold lockdown: can we win by folding every remaining hand?
             if not self._fold_lockdown:
@@ -215,8 +232,8 @@ class PlayerAgent(Agent):
             self.opp_profile.record_hand_end()
             self.hand_number += 1
 
-            # Update Bayesian beliefs periodically
-            if self.hand_number % 10 == 0:
+            # Update Bayesian beliefs every 5 hands for faster adaptation
+            if self.hand_number % 5 == 0:
                 self.opp_categorizer.update_beliefs(self.opp_profile)
 
             # Reset per-hand state
@@ -227,6 +244,7 @@ class PlayerAgent(Agent):
             self._prev_street = -1
             self._my_raises_this_street = 0
             self._current_street = -1
+            self._opp_raises_this_hand = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -243,17 +261,15 @@ class PlayerAgent(Agent):
         if hands_left <= 0 or self._bankroll <= 0:
             return
 
-        # Determine what blind we'll be NEXT hand.
-        # blind_position: 0 = we are SB this hand, 1 = we are BB this hand.
-        # Positions swap every hand, so next hand is the opposite.
         cur_blind = observation.get("blind_position", 0)
         next_is_sb = (cur_blind == 1)
 
-        # Walk through every remaining hand and sum the blind cost.
-        cost = int(1.5 * hands_left) + 1
+        cost = 0
+        is_sb = next_is_sb
+        for _ in range(hands_left):
+            cost += 1 if is_sb else 2
+            is_sb = not is_sb
 
-        # Lock down if we'd still be ahead by at least 1 chip after paying
-        # all remaining blinds.  bankroll - cost >= 1  ⟺  bankroll > cost
         if self._bankroll > cost:
             self._fold_lockdown = True
 
@@ -293,6 +309,16 @@ class PlayerAgent(Agent):
             raise_amount=raise_amt, pot_size=pot,
             was_facing_raise=was_facing,
         )
+
+        # Track post-flop raises for mechanical aggressor detection
+        if street > 0:
+            self._opp_postflop_actions += 1
+            if action_type == RAISE:
+                self._opp_postflop_raises += 1
+
+        # Track per-hand raises for re-raise equity discount
+        if action_type == RAISE:
+            self._opp_raises_this_hand += 1
 
         self._prev_opp_bet = opp_bet
         self._prev_my_bet = my_bet
